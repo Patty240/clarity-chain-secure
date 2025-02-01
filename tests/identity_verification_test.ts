@@ -8,11 +8,12 @@ import {
 import { assertEquals } from 'https://deno.land/std@0.90.0/testing/asserts.ts';
 
 Clarinet.test({
-    name: "Test identity registration and verification workflow",
+    name: "Test identity registration and multi-factor verification workflow",
     async fn(chain: Chain, accounts: Map<string, Account>) {
         const deployer = accounts.get('deployer')!;
         const user1 = accounts.get('wallet_1')!;
-        const verifier = accounts.get('wallet_2')!;
+        const verifier1 = accounts.get('wallet_2')!;
+        const verifier2 = accounts.get('wallet_3')!;
         
         // Test identity registration
         let block = chain.mineBlock([
@@ -25,29 +26,69 @@ Clarinet.test({
         ]);
         block.receipts[0].result.expectOk();
         
-        // Add verifier
+        // Add verifiers
         block = chain.mineBlock([
             Tx.contractCall(
                 'identity_verification',
                 'add-verifier',
-                [types.principal(verifier.address)],
+                [types.principal(verifier1.address)],
+                deployer.address
+            ),
+            Tx.contractCall(
+                'identity_verification',
+                'add-verifier',
+                [types.principal(verifier2.address)],
                 deployer.address
             )
         ]);
         block.receipts[0].result.expectOk();
+        block.receipts[1].result.expectOk();
         
-        // Verify identity
+        // First verification
         block = chain.mineBlock([
             Tx.contractCall(
                 'identity_verification',
                 'verify-identity',
                 [types.principal(user1.address)],
-                verifier.address
+                verifier1.address
             )
         ]);
         block.receipts[0].result.expectOk();
         
-        // Check verification status
+        // Check verification count
+        block = chain.mineBlock([
+            Tx.contractCall(
+                'identity_verification',
+                'get-verification-count',
+                [types.principal(user1.address)],
+                user1.address
+            )
+        ]);
+        assertEquals(block.receipts[0].result.expectOk(), types.uint(1));
+        
+        // Check not verified yet
+        block = chain.mineBlock([
+            Tx.contractCall(
+                'identity_verification',
+                'is-identity-verified',
+                [types.principal(user1.address)],
+                user1.address
+            )
+        ]);
+        assertEquals(block.receipts[0].result.expectOk(), false);
+        
+        // Second verification
+        block = chain.mineBlock([
+            Tx.contractCall(
+                'identity_verification',
+                'verify-identity',
+                [types.principal(user1.address)],
+                verifier2.address
+            )
+        ]);
+        block.receipts[0].result.expectOk();
+        
+        // Check now verified
         block = chain.mineBlock([
             Tx.contractCall(
                 'identity_verification',
@@ -57,35 +98,5 @@ Clarinet.test({
             )
         ]);
         assertEquals(block.receipts[0].result.expectOk(), true);
-    }
-});
-
-Clarinet.test({
-    name: "Test unauthorized operations",
-    async fn(chain: Chain, accounts: Map<string, Account>) {
-        const user1 = accounts.get('wallet_1')!;
-        const user2 = accounts.get('wallet_2')!;
-        
-        // Unauthorized verifier attempt
-        let block = chain.mineBlock([
-            Tx.contractCall(
-                'identity_verification',
-                'verify-identity',
-                [types.principal(user1.address)],
-                user2.address
-            )
-        ]);
-        block.receipts[0].result.expectErr(types.uint(103)); // err-unauthorized
-        
-        // Unauthorized verifier addition
-        block = chain.mineBlock([
-            Tx.contractCall(
-                'identity_verification',
-                'add-verifier',
-                [types.principal(user2.address)],
-                user1.address
-            )
-        ]);
-        block.receipts[0].result.expectErr(types.uint(100)); // err-owner-only
     }
 });

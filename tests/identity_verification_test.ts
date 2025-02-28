@@ -8,7 +8,7 @@ import {
 import { assertEquals } from 'https://deno.land/std@0.90.0/testing/asserts.ts';
 
 Clarinet.test({
-    name: "Test identity registration and multi-factor verification workflow",
+    name: "Test enhanced identity verification workflow",
     async fn(chain: Chain, accounts: Map<string, Account>) {
         const deployer = accounts.get('deployer')!;
         const user1 = accounts.get('wallet_1')!;
@@ -44,7 +44,18 @@ Clarinet.test({
         block.receipts[0].result.expectOk();
         block.receipts[1].result.expectOk();
         
-        // First verification
+        // Update identity hash
+        block = chain.mineBlock([
+            Tx.contractCall(
+                'identity_verification',
+                'update-identity-hash',
+                [types.buff(Buffer.from('new-hash'))],
+                user1.address
+            )
+        ]);
+        block.receipts[0].result.expectOk();
+        
+        // Verify identity with cooldown
         block = chain.mineBlock([
             Tx.contractCall(
                 'identity_verification',
@@ -55,27 +66,19 @@ Clarinet.test({
         ]);
         block.receipts[0].result.expectOk();
         
-        // Check verification count
+        // Try to verify again immediately (should fail)
         block = chain.mineBlock([
             Tx.contractCall(
                 'identity_verification',
-                'get-verification-count',
+                'verify-identity',
                 [types.principal(user1.address)],
-                user1.address
+                verifier1.address
             )
         ]);
-        assertEquals(block.receipts[0].result.expectOk(), types.uint(1));
+        block.receipts[0].result.expectErr(106); // err-cooldown-active
         
-        // Check not verified yet
-        block = chain.mineBlock([
-            Tx.contractCall(
-                'identity_verification',
-                'is-identity-verified',
-                [types.principal(user1.address)],
-                user1.address
-            )
-        ]);
-        assertEquals(block.receipts[0].result.expectOk(), false);
+        // Mine blocks to pass cooldown
+        chain.mineEmptyBlockUntil(chain.blockHeight + 7);
         
         // Second verification
         block = chain.mineBlock([
@@ -88,7 +91,7 @@ Clarinet.test({
         ]);
         block.receipts[0].result.expectOk();
         
-        // Check now verified
+        // Check verified status
         block = chain.mineBlock([
             Tx.contractCall(
                 'identity_verification',

@@ -11,6 +11,8 @@
 (define-constant err-insufficient-verifications (err u105))
 (define-constant err-cooldown-active (err u106))
 (define-constant err-expired-verification (err u107))
+(define-constant err-suspended (err u108))
+(define-constant err-invalid-status (err u109))
 
 (define-constant required-verifications u2)
 (define-constant verification-expiry-blocks u144) ;; ~24 hours
@@ -25,12 +27,14 @@
         verifications: (list 10 principal),
         timestamp: uint,
         last-update: uint,
-        status: bool
+        status: bool,
+        suspended: bool
     }
 )
 
 (define-map verifiers principal bool)
 (define-map verification-timestamps { identity: principal, verifier: principal } uint)
+(define-map verification-attempts principal uint)
 
 ;; Events
 (define-data-var last-event-id uint u0)
@@ -41,11 +45,12 @@
         event-type: (string-ascii 24),
         identity: principal,
         verifier: (optional principal),
-        timestamp: uint
+        timestamp: uint,
+        details: (optional (string-ascii 64))
     }
 )
 
-;; Private functions
+;; Enhanced private functions
 (define-private (is-owner)
     (is-eq tx-sender contract-owner)
 )
@@ -58,14 +63,15 @@
     (len verifications)
 )
 
-(define-private (log-event (event-type (string-ascii 24)) (identity principal) (verifier (optional principal)))
+(define-private (log-event (event-type (string-ascii 24)) (identity principal) (verifier (optional principal)) (details (optional (string-ascii 64))))
     (let ((event-id (+ (var-get last-event-id) u1)))
         (begin
             (map-set events event-id {
                 event-type: event-type,
                 identity: identity,
                 verifier: verifier,
-                timestamp: block-height
+                timestamp: block-height,
+                details: details
             })
             (var-set last-event-id event-id)
             event-id
@@ -73,67 +79,41 @@
     )
 )
 
-;; Public functions
-(define-public (register-identity (hash (buff 32)))
-    (let (
-        (existing-identity (map-get? identities tx-sender))
-    )
-    (if (is-some existing-identity)
-        err-already-registered
-        (begin
-            (map-set identities tx-sender {
-                hash: hash,
-                verified: false,
-                verifications: (list),
-                timestamp: block-height,
-                last-update: block-height,
-                status: true
-            })
-            (log-event "IDENTITY_REGISTERED" tx-sender none)
-            (ok true)
-        ))
-    )
-)
-
-(define-public (update-identity-hash (hash (buff 32)))
-    (let (
-        (existing-identity (map-get? identities tx-sender))
-    )
-    (if (is-some existing-identity)
-        (begin
-            (map-set identities tx-sender (merge (unwrap-panic existing-identity) {
-                hash: hash,
-                last-update: block-height
-            }))
-            (log-event "HASH_UPDATED" tx-sender none)
-            (ok true)
+;; New functions
+(define-public (suspend-identity (identity principal))
+    (let ((id-data (map-get? identities identity)))
+        (if (and (is-owner) (is-some id-data))
+            (begin
+                (map-set identities identity (merge (unwrap-panic id-data) {
+                    suspended: true,
+                    last-update: block-height
+                }))
+                (log-event "IDENTITY_SUSPENDED" identity none (some "Administrative action"))
+                (ok true)
+            )
+            err-unauthorized
         )
-        err-not-registered
-    ))
-)
-
-(define-public (add-verifier (verifier principal))
-    (if (is-owner)
-        (begin
-            (map-set verifiers verifier true)
-            (log-event "VERIFIER_ADDED" verifier none)
-            (ok true)
-        )
-        err-owner-only
     )
 )
 
-(define-public (remove-verifier (verifier principal))
-    (if (is-owner)
-        (begin
-            (map-delete verifiers verifier)
-            (log-event "VERIFIER_REMOVED" verifier none)
-            (ok true)
+(define-public (revoke-verification (identity principal))
+    (let ((id-data (map-get? identities identity)))
+        (if (and (is-owner) (is-some id-data))
+            (begin
+                (map-set identities identity (merge (unwrap-panic id-data) {
+                    verified: false,
+                    verifications: (list),
+                    last-update: block-height
+                }))
+                (log-event "VERIFICATION_REVOKED" identity none (some "Administrative action"))
+                (ok true)
+            )
+            err-unauthorized
         )
-        err-owner-only
     )
 )
 
+;; Enhanced existing functions
 (define-public (verify-identity (identity principal))
     (let (
         (id-data (map-get? identities identity))
@@ -145,34 +125,42 @@
             (current-verifications (get verifications unwrapped-data))
             (cooldown-expired (>= block-height (default-to u0 last-verification)))
         )
-        (if (not cooldown-expired)
-            err-cooldown-active
-            (if (get verified unwrapped-data)
-                err-already-verified
-                (let (
-                    (updated-verifications (unwrap-panic (as-max-len? (append current-verifications tx-sender) u10)))
-                    (verification-count (+ (count-verifications current-verifications) u1))
-                )
-                (begin
-                    (map-set verification-timestamps { identity: identity, verifier: tx-sender } (+ block-height verification-cooldown-blocks))
-                    (map-set identities identity (merge unwrapped-data {
-                        verifications: updated-verifications,
-                        verified: (>= verification-count required-verifications),
-                        last-update: block-height
-                    }))
-                    (log-event "IDENTITY_VERIFIED" identity (some tx-sender))
-                    (ok true)
-                ))))
+        (if (get suspended unwrapped-data)
+            err-suspended
+            (if (not cooldown-expired)
+                err-cooldown-active
+                (if (get verified unwrapped-data)
+                    err-already-verified
+                    (let (
+                        (updated-verifications (unwrap-panic (as-max-len? (append current-verifications tx-sender) u10)))
+                        (verification-count (+ (count-verifications current-verifications) u1))
+                    )
+                    (begin
+                        (map-set verification-timestamps { identity: identity, verifier: tx-sender } (+ block-height verification-cooldown-blocks))
+                        (map-set identities identity (merge unwrapped-data {
+                            verifications: updated-verifications,
+                            verified: (>= verification-count required-verifications),
+                            last-update: block-height
+                        }))
+                        (log-event "IDENTITY_VERIFIED" identity (some tx-sender) none)
+                        (ok true)
+                    ))))
         )
         err-unauthorized
     ))
 )
 
-;; Read only functions
-(define-read-only (get-identity-details (identity principal))
-    (map-get? identities identity)
-)
-
-(define-read-only (get-latest-event)
-    (map-get? events (var-get last-event-id))
+;; Enhanced read-only functions
+(define-read-only (get-verification-status (identity principal))
+    (let ((id-data (map-get? identities identity)))
+        (if (is-some id-data)
+            (ok {
+                verified: (get verified (unwrap-panic id-data)),
+                verification-count: (count-verifications (get verifications (unwrap-panic id-data))),
+                suspended: (get suspended (unwrap-panic id-data)),
+                last-update: (get last-update (unwrap-panic id-data))
+            })
+            err-not-registered
+        )
+    )
 )
